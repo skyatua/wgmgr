@@ -1,0 +1,212 @@
+#!/bin/bash
+
+RUN_DIR="$(dirname $(readlink -f $0))"
+KEYS_DIR="${RUN_DIR}/keys"
+CFG_FILE="${KEYS_DIR}/vars"
+SERVER_CFG="server"
+
+WG=$(type -p wg)
+[ -z "${WG}" ] && {
+	log "Please install wireguard package"
+	log "sudo apt update && sudo apt-get install wireguard resolvconf"
+	exit 1
+}
+WGQUICK=$(type -p wg-quick)
+
+usage() {
+     cat <<EOF
+${0##*/} -h|--help <options>
+
+Options:
+     [-f|--forced]			     - Recreate configuration
+     [-s|--server]			     - Create server configuration
+     [-p|--peer {peer name}]                 - Create peer configuration, on example 'pixel5a'
+     [-a|--ip {ip}]                          - IP/CIDR's list, on example 10.22.0.100/24
+
+
+Enable autostart:
+	sudo systemctl enable wg-quick@wg0.service
+	sudo systemctl daemon-reload
+	sudo systemctl start wg-quick@wg0
+
+Disable autostart:
+	sudo systemctl stop wg-quick@wg0
+	sudo systemctl disable wg-quick@wg0.service
+	sudo rm -i /etc/systemd/system/wg-quick@wg0*
+	sudo systemctl daemon-reload
+	sudo systemctl reset-failed
+EOF
+     return 0
+}
+
+options=$(getopt -o hfsp:a: -l help,forced,server,peer:,ip: -a -- "$@")
+if [ $? -ne 0 ]; then
+	usage
+	exit 1
+fi
+eval set -- "$options"
+
+log() {
+	echo "$@"
+}
+
+function create_default_cfg() {
+	log "Default configuration stored to ${CFG_FILE}"
+
+cat << EOF > ${CFG_FILE}
+IF="eth0"
+IP4="10.22.0.1/24"
+IP6="fd24:24:24::1/64"
+MTU="1420"
+SAVECONFIG="true"
+LISTENPORT="51820"
+SERVER_IP="194.233.166.71"
+DNS="8.8.8.8, 1.1.1.1"
+PEER_ALLOWEDIPs="10.22.0.0/16"
+PEER_PERSISTENTKEEPALIVE="25"
+EOF
+	cat ${CFG_FILE}
+}
+
+function generate_keys() {
+	local cfg="${1}"
+
+	umask 077
+	# Generate keys 
+	${WG} genkey | tee "${cfg}.priv" | ${WG} pubkey > "${cfg}.pub"
+}
+
+function create_server() {
+	local cfg="$1"
+
+	local cfg_file="${KEYS_DIR}/${cfg}.wg0.conf"
+
+	[ -z "${FORCED}" -a -f "${cfg_file}" ] && {
+		log "Configuration ${cfg_file} exists. Try with --forced option"
+		return 0
+	}
+
+	log "Create server configuration"
+
+	source ${CFG_FILE}
+
+	pushd "${KEYS_DIR}" 2>&1 > /dev/null
+	generate_keys "${cfg}"
+
+cat << EOF > "${cfg_file}"
+[Interface]
+Address = ${IP4}
+Address = ${IP6}
+MTU = ${MTU}
+SaveConfig = ${SAVECONFIG}
+PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${IF} -j MASQUERADE
+PostUp = echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+PostUp = echo 2 > /proc/sys/net/ipv6/conf/all/accept_ra; echo 2 > /proc/sys/net/ipv6/conf/${IF}/accept_ra; echo 2 > /proc/sys/net/ipv6/conf/wg0/accept_ra
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${IF} -j MASQUERADE
+PostUp = ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${IF} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${IF} -j MASQUERADE
+ListenPort = ${LISTENPORT}
+PrivateKey = $(cat ${cfg}.priv)
+EOF
+	popd 2>&1 >/dev/null
+
+	log "Done. Store in ${cfg_file}"
+
+	return 0
+}
+
+function add_peer() {
+	local cfg=$1
+	local ip="${2%%/*}"  # 0.0.0.0/32
+	local cidr="${2/${ip}/}"
+
+	[ -z "${cfg}" -o -z "${ip}" ] && {
+		usage
+		exit 1
+	}
+
+	local cfg_file="${KEYS_DIR}/${cfg}.wg0.conf"
+
+	[ -z "${FORCED}" -a -f "${cfg_file}" ] && {
+		log "Configuration ${cfg_file} exists. Try with --forced option"
+		return 0
+	}
+
+	log "Add new peer \"${cfg}\""
+
+	source ${CFG_FILE}
+
+	pushd "${KEYS_DIR}" 2>&1 >/dev/null
+	generate_keys "${cfg}"
+
+cat << EOF > "${cfg_file}"
+[Interface]
+Address = ${ip}
+DNS = ${DNS}
+PrivateKey = $(cat ${cfg}.priv) 
+
+[Peer]
+PublicKey = $(cat ${SERVER_CFG}.pub)
+AllowedIPs = ${PEER_ALLOWEDIPs}
+EndPoint = ${SERVER_IP}:${LISTENPORT}
+PersistentKeepalive = ${PEER_PERSISTENTKEEPALIVE}
+EOF
+	log "Done. Store in ${cfg_file}"
+
+	# Add peer configuration to /etc/wireguard/wg0.conf
+	cat << EOF > peer.conf
+[Peer]
+PublicKey = $(cat ${cfg}.pub) 
+AllowedIPs = ${ip}/32
+EOF
+
+	log "Refresh server configuration"
+
+	${WG} addconf wg0 peer.conf
+	${WGQUICK} save wg0
+
+	popd 2>&1 >/dev/null
+
+	return 0
+}
+
+CMD=
+PEER_NAME=
+IPs=
+FORCED=
+while true; do
+	case "$1" in
+		-h|--help)          usage; exit 0;;
+		-f|--forced)	    FORCED=1; shift 1;;
+		-s|--server)        CMD="server"; shift 1;;
+		-p|--peer)          CMD="peer"; PEER_NAME="$2"; shift 2;;
+		-a|--ip)            IPs="$2"; shift 2;;
+		--)                 shift 1; break ;;
+		*)                  break ;;
+	esac
+done
+
+[ -d "${KEYS_DIR}" ] || mkdir -p ${KEYS_DIR}
+[ -f "${CFG_FILE}" ] || create_default_cfg
+
+[ -f "${KEYS_DIR}/${SERVER_CFG}.priv" ] || {
+	log "WARNING! Not found server keys pair"
+	log "Run ${0##*/} --server"
+	exit 1
+}
+
+case $CMD in
+	"server") 
+		create_server "${SERVER_CFG}" 
+	;;
+	"peer")
+		add_peer "${PEER_NAME}" "${IPs}"
+	;;
+	*) 
+		usage
+		exit 0
+	;;
+esac
+
+exit 0
