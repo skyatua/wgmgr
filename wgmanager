@@ -5,6 +5,10 @@ KEYS_DIR="${RUN_DIR}/keys"
 CFG_FILE="${KEYS_DIR}/vars"
 SERVER_CFG="server"
 
+function log() {
+	echo "$@"
+}
+
 WG=$(type -p wg)
 [ -z "${WG}" ] && {
 	log "Please install wireguard package"
@@ -122,6 +126,7 @@ function add_peer() {
 	local cidr="${2/${ip}/}"
 
 	[ -z "${cfg}" -o -z "${ip}" ] && {
+		log "Peer name or IPs is empty"
 		usage
 		exit 1
 	}
@@ -152,6 +157,11 @@ AllowedIPs = ${PEER_ALLOWEDIPs}
 EndPoint = ${SERVER_IP}:${LISTENPORT}
 PersistentKeepalive = ${PEER_PERSISTENTKEEPALIVE}
 EOF
+
+	chmod 644 ${cfg_file} 
+	# Copy dublicate to $HOME dir
+	cp -f ${cfg_file} ~/
+
 	log "Done. Store in ${cfg_file}"
 
 	# Add peer configuration to /etc/wireguard/wg0.conf
@@ -191,9 +201,11 @@ done
 [ -f "${CFG_FILE}" ] || create_default_cfg
 
 [ -f "${KEYS_DIR}/${SERVER_CFG}.priv" ] || {
-	log "WARNING! Not found server keys pair"
-	log "Run ${0##*/} --server"
-	exit 1
+	[ "${CMD}" != "server" ] && { 
+		log "WARNING! Not found server keys pair"
+		log "Run ${0##*/} --server"
+		exit 1
+	}
 }
 
 case $CMD in
